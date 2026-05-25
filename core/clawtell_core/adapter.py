@@ -33,7 +33,14 @@ class InboundMessage:
             or d.get("createdAt")
             or d.get("received_at")
             or "",
-            auto_reply_eligible=bool(d.get("auto_reply_eligible", False)),
+            # The live ClawTell API returns ``autoReplyEligible`` (camelCase) on
+            # the JSON wire. ``auto_reply_eligible`` is accepted as a fallback
+            # for forward-compat and for tests that build dicts by hand.
+            auto_reply_eligible=bool(
+                d.get("autoReplyEligible")
+                if "autoReplyEligible" in d
+                else d.get("auto_reply_eligible", False)
+            ),
             raw=d,
         )
 

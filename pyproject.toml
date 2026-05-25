@@ -18,6 +18,11 @@ dev = [
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# importlib mode avoids the module-name collision that fires when multiple
+# package directories each ship a ``tests/conftest.py`` (they would otherwise
+# both register as ``tests.conftest``). With importlib, conftest files are
+# imported by path, not by package name.
+importmode = "importlib"
 testpaths = ["core/tests", "hermes/tests", "langgraph/tests", "telegram/tests"]
 filterwarnings = [
     "ignore::DeprecationWarning",

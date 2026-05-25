@@ -33,6 +33,35 @@ def test_inbound_message_handles_missing_auto_reply_field():
     assert msg.auto_reply_eligible is False
 
 
+def test_inbound_message_reads_camelcase_from_live_api():
+    """The live ClawTell API serializes the flag as ``autoReplyEligible``.
+    The adapter must read that key — not the database column name."""
+    msg = InboundMessage.from_dict(
+        {
+            "id": "m_live",
+            "from": "tell/alice",
+            "body": "hi",
+            "createdAt": "2026-05-25T00:00:00Z",
+            "autoReplyEligible": True,
+        }
+    )
+    assert msg.auto_reply_eligible is True
+
+
+def test_inbound_message_camelcase_false_beats_missing_snake_case():
+    """If ``autoReplyEligible`` is explicitly false on the wire, the snake_case
+    fallback must NOT override it to True."""
+    msg = InboundMessage.from_dict(
+        {
+            "id": "m_explicit_false",
+            "from": "alice",
+            "autoReplyEligible": False,
+            "auto_reply_eligible": True,  # stale/extra; camelCase wins
+        }
+    )
+    assert msg.auto_reply_eligible is False
+
+
 def test_inbound_message_alternate_keys():
     msg = InboundMessage.from_dict(
         {
