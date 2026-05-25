@@ -1,0 +1,103 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'core/pyproject.toml'
+      - 'hermes/pyproject.toml'
+      - 'langgraph/pyproject.toml'
+      - 'telegram/pyproject.toml'
+  workflow_dispatch:
+    inputs:
+      package:
+        description: 'Package to force-publish (core, hermes, langgraph, telegram, or all). Leave empty to publish only changed packages.'
+        required: false
+        default: ''
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        package:
+          - { dir: core,      name: clawtell-core }
+          - { dir: hermes,    name: clawtell-hermes }
+          - { dir: langgraph, name: clawtell-langgraph }
+          - { dir: telegram,  name: clawtell-telegram }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Decide whether to publish ${{ matrix.package.name }}
+        id: decide
+        run: |
+          force="${{ github.event.inputs.package }}"
+          if [ "$force" = "all" ] || [ "$force" = "${{ matrix.package.dir }}" ]; then
+            echo "publish=true" >> $GITHUB_OUTPUT
+          elif git diff --name-only HEAD^ HEAD 2>/dev/null | grep -q "^${{ matrix.package.dir }}/pyproject.toml$"; then
+            echo "publish=true" >> $GITHUB_OUTPUT
+          else
+            echo "publish=false" >> $GITHUB_OUTPUT
+            echo "no version change for ${{ matrix.package.name }}; skipping"
+          fi
+
+      - uses: actions/setup-python@v5
+        if: steps.decide.outputs.publish == 'true'
+        with:
+          python-version: '3.12'
+
+      - name: Install build tooling
+        if: steps.decide.outputs.publish == 'true'
+        run: |
+          python -m pip install --upgrade pip
+          pip install build twine
+
+      - name: Read version
+        if: steps.decide.outputs.publish == 'true'
+        id: version
+        working-directory: ${{ matrix.package.dir }}
+        run: |
+          version=$(python -c "import tomllib; print(tomllib.loads(open('pyproject.toml','rb').read().decode())['project']['version'])")
+          echo "version=$version" >> $GITHUB_OUTPUT
+
+      - name: Check if release already exists
+        if: steps.decide.outputs.publish == 'true'
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${{ matrix.package.name }}-v${{ steps.version.outputs.version }}"
+          if gh release view "$tag" &>/dev/null; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build
+        if: steps.decide.outputs.publish == 'true' && steps.check.outputs.exists == 'false'
+        working-directory: ${{ matrix.package.dir }}
+        run: python -m build
+
+      - name: Publish to PyPI
+        if: steps.decide.outputs.publish == 'true' && steps.check.outputs.exists == 'false'
+        working-directory: ${{ matrix.package.dir }}
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
+        run: twine upload dist/*
+
+      - name: Create GitHub Release
+        if: steps.decide.outputs.publish == 'true' && steps.check.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${{ matrix.package.name }}-v${{ steps.version.outputs.version }}"
+          gh release create "$tag" \
+            --title "$tag" \
+            --notes "Published to PyPI as \`${{ matrix.package.name }}==${{ steps.version.outputs.version }}\`"

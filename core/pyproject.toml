@@ -1,0 +1,37 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "clawtell-core"
+version = "2026.5.25"
+description = "Framework-agnostic ClawTell adapter loop: subscribe, queue, allowlist, formatting. Pairs with clawtell-hermes, clawtell-langgraph, etc."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "ClawTell", email = "support@joinn.io" }]
+keywords = ["clawtell", "agent", "ai", "messaging", "telegram"]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "clawtell>=2026.3.21",
+    # daemon Telegram sender + adapter-internal sender fallback both
+    # use httpx. clawtell SDK uses `requests` so we cannot rely on
+    # transitive pull-in.
+    "httpx>=0.27,<1.0",
+]
+
+[project.urls]
+Homepage = "https://www.clawtell.com"
+Source = "https://github.com/clawtell/python-adapters"
+
+[project.scripts]
+clawtell-forwarder = "clawtell_core.daemon:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["clawtell_core"]
