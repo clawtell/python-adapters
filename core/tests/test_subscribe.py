@@ -146,6 +146,69 @@ def test_dedup_window_eviction_is_fifo():
 
 
 @pytest.mark.asyncio
+async def test_reply_path_is_idempotent_on_redelivery(isolated_clawtell_home):
+    """Crash between client.send() (reply to sender) and client.ack() ⇒
+    server redelivers the inbound. The dedup window catches it in the
+    same process incarnation, but a fresh process has no in-memory dedup.
+    The disk-backed replied list must prevent a second client.send()."""
+    client = _StubClient()
+    adapter = _RecordingAdapter(reply_text="pong")
+    adapter.bind_chat(ChatTarget(channel="telegram", chat_id="TEST"))
+    queue = InboxQueue()
+    msg = InboundMessage.from_dict(_raw_msg("dup-reply", eligible=True))
+
+    # First incarnation: reply send_back happens, then "crash" before ack
+    # (simulated by NOT running ack — we'll check queue state directly).
+    await _process(client, adapter, queue, msg)
+    assert client.sent == [("alice", "pong", "Re: hi")]
+    assert queue.has_replied("dup-reply") is True
+
+    # Second incarnation: same message id re-delivered. Reply must NOT
+    # be sent again. Forward + ack still happen (the human chat is a
+    # separate concern; double-forward is benign and rare anyway since
+    # the dedup window catches most re-dispatches in-process).
+    client2 = _StubClient()
+    queue2 = InboxQueue()           # fresh instance, same on-disk state
+    await _process(client2, adapter, queue2, msg)
+    assert client2.sent == []        # NO duplicate reply
+    assert client2.acked == ["dup-reply"]
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_file_touched_during_loop(
+    isolated_clawtell_home, tmp_path
+):
+    """Heartbeat mtime must advance while the loop is making progress."""
+    import os
+
+    client = _StubClient(batches=[[_raw_msg("hb1", eligible=False)]])
+    adapter = _RecordingAdapter()
+    adapter.bind_chat(ChatTarget(channel="telegram", chat_id="TEST"))
+
+    hb = tmp_path / "heartbeat"
+    stop = asyncio.Event()
+
+    async def run_and_stop():
+        await asyncio.sleep(0.3)
+        stop.set()
+
+    asyncio.create_task(run_and_stop())
+    await subscribe(
+        client,
+        adapter,
+        poll_timeout=0,
+        empty_poll_sleep=0.05,
+        drain_interval=999,
+        stop_event=stop,
+        heartbeat_file=hb,
+    )
+    assert hb.exists()
+    # mtime should be recent (< 5s old) since we just stopped.
+    import time as _t
+    assert _t.time() - os.path.getmtime(hb) < 5
+
+
+@pytest.mark.asyncio
 async def test_subscribe_dedups_redelivered_id(isolated_clawtell_home):
     """If the same message id arrives twice (e.g. ack race), the second
     is silently re-acked and dispatch happens only once."""

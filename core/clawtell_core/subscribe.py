@@ -15,8 +15,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Optional
 
 from clawtell_core.adapter import (
@@ -30,6 +32,23 @@ log = logging.getLogger(__name__)
 
 
 DEDUP_WINDOW = 500
+
+
+def _touch_heartbeat(path: Optional[Path]) -> None:
+    """Update mtime of the heartbeat file so external watchdogs can detect
+    a hung-but-alive forwarder. Called at every progress checkpoint inside
+    the receive loop — start of poll, after each ack, after each send,
+    before sleep — so "stale heartbeat" means the loop has genuinely
+    stopped making progress, not just that we're mid-message."""
+    if path is None:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # ``Path.touch`` updates mtime if exists, else creates.
+        path.touch(exist_ok=True)
+        os.utime(path, None)
+    except OSError as e:
+        log.warning("heartbeat write failed (%s): %s", path, e)
 
 
 class _DedupWindow:
@@ -64,6 +83,7 @@ async def subscribe(
     drain_interval: float = 60.0,
     empty_poll_sleep: float = 1.0,
     stop_event: Optional[asyncio.Event] = None,
+    heartbeat_file: Optional[Path] = None,
 ) -> None:
     """Run the receive loop until ``stop_event`` is set (or forever).
 
@@ -75,13 +95,18 @@ async def subscribe(
         poll_limit: max messages per poll.
         drain_interval: seconds between queue-drain attempts.
         stop_event: optional asyncio.Event to break the loop.
+        heartbeat_file: optional path touched at every progress checkpoint.
+            External watchdogs (systemd, k8s liveness, sidecar cron) can
+            detect hung-but-alive by comparing mtime to a stale threshold.
     """
     queue = InboxQueue()
     dedup = _DedupWindow()
     last_drain = 0.0
     log.info("subscribe loop starting (timeout=%ds, limit=%d)", poll_timeout, poll_limit)
+    _touch_heartbeat(heartbeat_file)
 
     while not (stop_event and stop_event.is_set()):
+        _touch_heartbeat(heartbeat_file)
         try:
             res = await asyncio.to_thread(
                 client.poll, timeout=poll_timeout, limit=poll_limit
@@ -110,15 +135,18 @@ async def subscribe(
             handled = await _process(client, adapter, queue, msg)
             if handled:
                 dedup.add(msg.id)
+            _touch_heartbeat(heartbeat_file)
 
         # Periodic queue drain — same flow per queued message.
         now = time.monotonic()
         if now - last_drain >= drain_interval:
             last_drain = now
             await _drain(client, adapter, queue, dedup)
+            _touch_heartbeat(heartbeat_file)
 
         # Empty poll → brief sleep so we don't spin on rare server quirks.
         if not messages:
+            _touch_heartbeat(heartbeat_file)
             await asyncio.sleep(empty_poll_sleep)
 
 
@@ -170,17 +198,29 @@ async def _process(
         reply = await adapter.inject(msg)
         await adapter.forward(HumanNotification(inbound=msg, reply=reply), chat)
         if reply and not reply.refusal:
-            try:
-                await asyncio.to_thread(
-                    client.send,
-                    msg.from_name,
-                    reply.text,
-                    f"Re: {msg.subject}" if msg.subject else None,
+            # Idempotency: if this id was already replied to in a prior
+            # process incarnation that crashed before acking, skip the
+            # send_back so the sender doesn't see a duplicate reply on
+            # server redelivery.
+            if queue.has_replied(msg.id):
+                log.info(
+                    "skipping duplicate send_back for msg %s (already replied "
+                    "in prior run; this is the post-crash ack)",
+                    msg.id,
                 )
-            except Exception as e:
-                log.error(
-                    "reply send-back failed for msg %s: %s", msg.id, e
-                )
+            else:
+                try:
+                    await asyncio.to_thread(
+                        client.send,
+                        msg.from_name,
+                        reply.text,
+                        f"Re: {msg.subject}" if msg.subject else None,
+                    )
+                    queue.mark_replied(msg.id)
+                except Exception as e:
+                    log.error(
+                        "reply send-back failed for msg %s: %s", msg.id, e
+                    )
         await asyncio.to_thread(client.ack, [msg.id])
         log.info("handled msg %s from tell/%s", msg.id, msg.from_name)
         return True
@@ -224,13 +264,14 @@ async def _drain(
                 await adapter.forward(
                     HumanNotification(inbound=msg, reply=reply), chat
                 )
-                if reply and not reply.refusal:
+                if reply and not reply.refusal and not queue.has_replied(msg.id):
                     await asyncio.to_thread(
                         client.send,
                         msg.from_name,
                         reply.text,
                         f"Re: {msg.subject}" if msg.subject else None,
                     )
+                    queue.mark_replied(msg.id)
             await asyncio.to_thread(client.ack, [msg.id])
             queue.dequeue(msg.id)
             dedup.add(msg.id)

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "clawtell-core"
-version = "2026.5.29"
+version = "2026.5.30"
 description = "Framework-agnostic ClawTell adapter loop: subscribe, queue, allowlist, formatting. Pairs with clawtell-hermes, clawtell-langgraph, etc."
 readme = "README.md"
 requires-python = ">=3.10"

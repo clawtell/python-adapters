@@ -1,17 +1,20 @@
 """``clawtell-forwarder`` console entry point.
 
-Runs ``subscribe(client, adapter)`` as a long-lived process. Adapter is
-loaded by dotted path so users don't write their own daemonizer.
+Default mode (no subcommand) runs ``subscribe(client, adapter)`` as a
+long-lived process. Three onboarding subcommands also live here:
 
-Usage::
+    clawtell-forwarder check         # validate config end-to-end
+    clawtell-forwarder discover-chat # capture chat_id from first inbound Telegram update
+    clawtell-forwarder send-test     # send a "ClawTell connected" test message
+
+Usage (forwarder)::
 
     clawtell-forwarder \\
         --adapter clawtell_hermes:HermesAdapter \\
         --agent-factory my_agent:make_agent \\
         --telegram-token-env TG_BOT_TOKEN
 
-Or simpler — for the "just forward to Telegram, no agent reply" case
-(matches what the user built by hand on Hermes)::
+Or the "just forward to Telegram, no agent reply" path::
 
     clawtell-forwarder --forward-only --telegram-token-env TG_BOT_TOKEN
 """
@@ -124,11 +127,15 @@ def _normalize_directory(data: object) -> dict[str, str]:
     }
 
 
-def _load_directory() -> dict[str, str]:
-    path = Path(
+def _directory_path() -> Path:
+    return Path(
         os.environ.get("CLAWTELL_CHANNEL_DIRECTORY")
         or (Path.home() / ".clawtell" / "channel-directory.json")
     )
+
+
+def _load_directory() -> dict[str, str]:
+    path = _directory_path()
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -197,6 +204,48 @@ def _discover_telegram_token(env_name: str) -> Optional[str]:
     return None
 
 
+def _log_boot_config(args: argparse.Namespace, tg_token: bool) -> None:
+    """One line at boot listing every effective config knob. Half of all
+    "why isn't it working" questions are answered by reading this line."""
+    if args.adapter:
+        mode = "full"
+    elif args.forward_only:
+        mode = "forward-only"
+    else:
+        # Current behavior: implicit forward-only if no --adapter. Make
+        # the inferred mode visible so users don't wonder later.
+        mode = "forward-only (inferred — pass --forward-only to be explicit)"
+    parts = [
+        f"mode={mode}",
+        f"adapter={args.adapter or '-'}",
+        f"agent_factory={args.agent_factory or '-'}",
+        f"graph_factory={args.graph_factory or '-'}",
+        f"default_chat={args.default_chat or '-'}",
+        f"factory_timeout={args.factory_timeout:.0f}s",
+        f"heartbeat_file={args.heartbeat_file or '-'}",
+        f"telegram_token={'set' if tg_token else 'missing'}",
+        f"channel_directory={_directory_path()}",
+    ]
+    log.info("boot config: %s", " ".join(parts))
+
+
+def _deployment_shape_advisory(args: argparse.Namespace) -> None:
+    """Warn when the user is likely running a second AIAgent in a container
+    that already has one (e.g. OpenClaw gateway). Two AIAgent ctors in one
+    memory budget is the most common stall mode. ``--allow-collocated-agent``
+    silences this when the user has consciously sized the host."""
+    if args.adapter and not args.allow_collocated_agent:
+        log.warning(
+            "deployment-shape: running --adapter (full mode) — if another "
+            "AIAgent already runs in this container/host (e.g. an OpenClaw "
+            "gateway), each inbound spins up a *second* AIAgent ctor and "
+            "you will hit memory pressure or factory_timeout. Use "
+            "--forward-only when an agent is already collocated, or pass "
+            "--allow-collocated-agent to silence this warning. See: "
+            "https://github.com/clawtell/python-adapters/blob/main/core/README.md#deployment-shapes"
+        )
+
+
 async def _amain(args: argparse.Namespace) -> int:
     creds = load_credentials(api_key=args.api_key, name=args.name)
     if not creds.api_key:
@@ -212,6 +261,8 @@ async def _amain(args: argparse.Namespace) -> int:
     client = ClawTell(api_key=creds.api_key)
 
     tg_token = _discover_telegram_token(args.telegram_token_env or "TG_BOT_TOKEN")
+    _log_boot_config(args, bool(tg_token))
+    _deployment_shape_advisory(args)
     sender = None
     sender_close = None
     if tg_token:
@@ -301,24 +352,292 @@ async def _amain(args: argparse.Namespace) -> int:
         except NotImplementedError:
             signal.signal(sig, _shutdown)  # windows
 
+    heartbeat = Path(args.heartbeat_file) if args.heartbeat_file else None
     try:
-        await subscribe(client, adapter, stop_event=stop)
+        await subscribe(
+            client, adapter, stop_event=stop, heartbeat_file=heartbeat
+        )
     finally:
         if sender_close is not None:
             await sender_close.aclose()
     return 0
 
 
+# ───────────────────────────── subcommands ─────────────────────────────
+
+
+async def _cmd_check(args: argparse.Namespace) -> int:
+    """Preflight: validate API key, ping API, validate Telegram token,
+    validate chat binding. Exits 0 with green checks or non-zero with a
+    precise diagnostic so misconfig dies loud at install time, not
+    silently at runtime."""
+    ok = True
+
+    def line(symbol: str, label: str, detail: str = "") -> None:
+        suffix = f"  ({detail})" if detail else ""
+        print(f"  {symbol} {label}{suffix}")
+
+    print("clawtell-forwarder check")
+    print("=" * 60)
+
+    creds = load_credentials(api_key=args.api_key, name=args.name)
+    if not creds.api_key:
+        line(
+            "x",
+            "CLAWTELL_API_KEY",
+            "not found in env, ~/.config/clawtell.env, ~/.clawtell/credentials.env",
+        )
+        return 1
+    line("✓", "CLAWTELL_API_KEY", f"loaded ({len(creds.api_key)} chars)")
+
+    try:
+        from clawtell import ClawTell
+
+        client = ClawTell(api_key=creds.api_key)
+        me = await asyncio.to_thread(client.me)
+        line(
+            "✓",
+            "ClawTell API auth",
+            f"agent tell/{me.get('name', '?')}",
+        )
+    except Exception as e:
+        line("x", "ClawTell API auth", str(e))
+        return 1
+
+    tg_token = _discover_telegram_token(args.telegram_token_env or "TG_BOT_TOKEN")
+    if not tg_token:
+        line(
+            "x",
+            "Telegram bot token",
+            f"not found in env ({args.telegram_token_env}, TELEGRAM_BOT_TOKEN, TG_BOT_TOKEN)",
+        )
+        ok = False
+    else:
+        try:
+            import httpx
+
+            async with httpx.AsyncClient(timeout=10.0) as http:
+                r = await http.get(f"https://api.telegram.org/bot{tg_token}/getMe")
+            if r.status_code == 200 and r.json().get("ok"):
+                bot = r.json()["result"]
+                line(
+                    "✓",
+                    "Telegram bot token",
+                    f"@{bot.get('username', '?')}",
+                )
+            else:
+                line(
+                    "x",
+                    "Telegram bot token",
+                    f"getMe returned {r.status_code} — token invalid or revoked",
+                )
+                ok = False
+        except Exception as e:
+            line("x", "Telegram bot token", f"network error: {e}")
+            ok = False
+
+    directory = _load_directory()
+    if directory:
+        default_chat = directory.get("_default")
+        line(
+            "✓",
+            "Channel directory",
+            f"{len(directory)} entries, _default={default_chat or 'none'}",
+        )
+    elif args.default_chat:
+        line(
+            "✓",
+            "Channel binding",
+            f"--default-chat={args.default_chat}",
+        )
+    else:
+        line(
+            "!",
+            "Channel binding",
+            "no directory file and no --default-chat — daemon will queue "
+            "all inbounds until you bind a chat. Run 'clawtell-forwarder "
+            "discover-chat' to capture one.",
+        )
+
+    print("=" * 60)
+    if ok:
+        print("OK — config looks healthy")
+        return 0
+    print("FAIL — fix the items marked x above")
+    return 1
+
+
+async def _cmd_discover_chat(args: argparse.Namespace) -> int:
+    """Listen for the first inbound Telegram update, print the chat_id,
+    optionally write it to ~/.clawtell/channel-directory.json. Removes
+    the chat-ID hunt that bites every new user."""
+    tg_token = _discover_telegram_token(args.telegram_token_env or "TG_BOT_TOKEN")
+    if not tg_token:
+        print(
+            f"error: no Telegram bot token found in env "
+            f"({args.telegram_token_env}, TELEGRAM_BOT_TOKEN, TG_BOT_TOKEN)",
+            file=sys.stderr,
+        )
+        return 2
+
+    print(
+        "Send any message to your Telegram bot now. Waiting up to "
+        f"{args.timeout}s..."
+    )
+    import httpx
+
+    base = f"https://api.telegram.org/bot{tg_token}"
+    deadline = asyncio.get_event_loop().time() + args.timeout
+    offset: Optional[int] = None
+    async with httpx.AsyncClient(timeout=35.0) as http:
+        while asyncio.get_event_loop().time() < deadline:
+            params: dict = {"timeout": 30}
+            if offset is not None:
+                params["offset"] = offset
+            try:
+                r = await http.get(f"{base}/getUpdates", params=params)
+                payload = r.json()
+            except Exception as e:
+                print(f"poll error: {e}", file=sys.stderr)
+                await asyncio.sleep(2)
+                continue
+            for update in payload.get("result", []) or []:
+                offset = update["update_id"] + 1
+                msg = update.get("message") or update.get("edited_message") or {}
+                chat = msg.get("chat") or {}
+                chat_id = chat.get("id")
+                if chat_id is None:
+                    continue
+                chat_id_str = str(chat_id)
+                title = (
+                    chat.get("title")
+                    or chat.get("username")
+                    or chat.get("first_name")
+                    or "?"
+                )
+                kind = chat.get("type", "?")
+                print()
+                print(f"chat_id: {chat_id_str}")
+                print(f"name:    {title}")
+                print(f"type:    {kind}")
+                if args.write:
+                    return _write_directory(chat_id_str, title)
+                print()
+                print("To bind this chat:")
+                print(f"  clawtell-forwarder --default-chat {chat_id_str} ...")
+                print("Or rerun with --write to persist to "
+                      "~/.clawtell/channel-directory.json")
+                return 0
+    print("timeout — no Telegram update received", file=sys.stderr)
+    return 1
+
+
+def _write_directory(chat_id: str, label: str) -> int:
+    path = _directory_path()
+    try:
+        existing = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(existing, dict):
+            existing = {}
+    except (FileNotFoundError, json.JSONDecodeError):
+        existing = {}
+    existing["_default"] = chat_id
+    safe_label = "".join(c for c in label if c.isalnum() or c in "-_") or "user"
+    existing[safe_label] = chat_id
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    print()
+    print(f"wrote {path}")
+    print(f"  _default = {chat_id}")
+    print(f"  {safe_label} = {chat_id}")
+    return 0
+
+
+async def _cmd_send_test(args: argparse.Namespace) -> int:
+    """End-to-end self-test: send a "ClawTell connected" message via the
+    configured Telegram sender to the bound chat. Confirms the full pipe
+    (auth → token → chat → Telegram) before any real traffic flows."""
+    tg_token = _discover_telegram_token(args.telegram_token_env or "TG_BOT_TOKEN")
+    if not tg_token:
+        print(
+            f"error: no Telegram bot token found in env "
+            f"({args.telegram_token_env}, TELEGRAM_BOT_TOKEN, TG_BOT_TOKEN)",
+            file=sys.stderr,
+        )
+        return 2
+
+    if args.default_chat:
+        chat_id = args.default_chat
+        source = "--default-chat"
+    else:
+        directory = _load_directory()
+        if args.to and args.to in directory:
+            chat_id = directory[args.to]
+            source = f"directory[{args.to}]"
+        elif "_default" in directory:
+            chat_id = directory["_default"]
+            source = "directory[_default]"
+        else:
+            print(
+                "error: no chat binding — pass --default-chat <id>, "
+                "--to <name>, or populate ~/.clawtell/channel-directory.json",
+                file=sys.stderr,
+            )
+            return 2
+
+    import httpx
+
+    text = (
+        "ClawTell connected — this is a test message from "
+        "`clawtell-forwarder send-test`. If you see this, your bot token, "
+        "chat binding, and network egress are all working."
+    )
+    async with httpx.AsyncClient(timeout=15.0) as http:
+        r = await http.post(
+            f"https://api.telegram.org/bot{tg_token}/sendMessage",
+            json={"chat_id": chat_id, "text": text},
+        )
+    if r.status_code == 200 and r.json().get("ok"):
+        print(f"OK — test message delivered to chat {chat_id} ({source})")
+        return 0
+    print(
+        f"FAIL — Telegram returned {r.status_code}: {r.text}", file=sys.stderr
+    )
+    return 1
+
+
+# ─────────────────────────────── entry ────────────────────────────────
+
+
+def _add_common_flags(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--api-key", help="override CLAWTELL_API_KEY")
+    p.add_argument("--name", help="override CLAWTELL_NAME")
+    p.add_argument(
+        "--telegram-token-env",
+        default="TG_BOT_TOKEN",
+        help="env var holding the Telegram bot token",
+    )
+    p.add_argument(
+        "--log-level",
+        default=os.environ.get("CLAWTELL_LOG_LEVEL", "INFO"),
+        help="DEBUG / INFO / WARNING / ERROR",
+    )
+
+
 def main() -> None:
     p = argparse.ArgumentParser(prog="clawtell-forwarder")
+
+    # ── forwarder flags on the MAIN parser so the no-subcommand mode
+    #    (existing usage) keeps working without changes. Subparsers
+    #    below add their own flags for the onboarding subcommands.
     p.add_argument("--adapter", help="dotted path to adapter class, e.g. clawtell_hermes:HermesAdapter")
     p.add_argument("--agent-factory", help="dotted path to zero-arg factory returning a framework agent instance (Hermes-style — called per message)")
     p.add_argument("--graph-factory", help="dotted path to zero-arg factory returning a compiled graph (LangGraph-style — called once at startup)")
     p.add_argument("--forward-only", action="store_true", help="no agent; just forward inbound to Telegram")
-    p.add_argument("--telegram-token-env", default="TG_BOT_TOKEN", help="env var holding the Telegram bot token")
     p.add_argument("--default-chat", help="Telegram chat_id fallback if no directory")
-    p.add_argument("--api-key", help="override CLAWTELL_API_KEY")
-    p.add_argument("--name", help="override CLAWTELL_NAME")
     p.add_argument(
         "--factory-timeout",
         type=float,
@@ -331,16 +650,78 @@ def main() -> None:
         ),
     )
     p.add_argument(
-        "--log-level",
-        default=os.environ.get("CLAWTELL_LOG_LEVEL", "INFO"),
-        help="DEBUG / INFO / WARNING / ERROR",
+        "--heartbeat-file",
+        default=os.environ.get("CLAWTELL_HEARTBEAT_FILE"),
+        help=(
+            "path touched at every progress checkpoint (start of poll, "
+            "after each ack, after each send, before sleep). Use with an "
+            "external watchdog (systemd, k8s liveness, sidecar cron) to "
+            "detect hung-but-alive. Off by default. "
+            "Env: CLAWTELL_HEARTBEAT_FILE."
+        ),
     )
+    p.add_argument(
+        "--allow-collocated-agent",
+        action="store_true",
+        help=(
+            "silence the deployment-shape warning when running --adapter "
+            "(full mode) on a host that already has another AIAgent (e.g. "
+            "OpenClaw gateway). Only pass this once you've sized the host "
+            "for two AIAgent instances."
+        ),
+    )
+    _add_common_flags(p)
+
+    sub = p.add_subparsers(dest="subcommand", required=False)
+
+    check_p = sub.add_parser(
+        "check",
+        help="validate config end-to-end (API auth, Telegram token, chat binding)",
+    )
+    _add_common_flags(check_p)
+    check_p.add_argument("--default-chat", help="Telegram chat_id to validate")
+
+    disc_p = sub.add_parser(
+        "discover-chat",
+        help="capture chat_id from the first inbound Telegram update",
+    )
+    _add_common_flags(disc_p)
+    disc_p.add_argument(
+        "--write",
+        action="store_true",
+        help="persist the captured chat_id to ~/.clawtell/channel-directory.json",
+    )
+    disc_p.add_argument(
+        "--timeout",
+        type=int,
+        default=300,
+        help="seconds to wait for an inbound (default 300)",
+    )
+
+    sent_p = sub.add_parser(
+        "send-test",
+        help='send a "ClawTell connected" test message end-to-end',
+    )
+    _add_common_flags(sent_p)
+    sent_p.add_argument("--to", help="sender name from channel-directory.json")
+    sent_p.add_argument(
+        "--default-chat",
+        help="Telegram chat_id to send to (overrides directory)",
+    )
+
     args = p.parse_args()
 
     logging.basicConfig(
-        level=args.log_level.upper(),
+        level=str(getattr(args, "log_level", "INFO")).upper(),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+
+    if args.subcommand == "check":
+        sys.exit(asyncio.run(_cmd_check(args)))
+    if args.subcommand == "discover-chat":
+        sys.exit(asyncio.run(_cmd_discover_chat(args)))
+    if args.subcommand == "send-test":
+        sys.exit(asyncio.run(_cmd_send_test(args)))
 
     sys.exit(asyncio.run(_amain(args)))
 

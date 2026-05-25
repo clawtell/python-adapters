@@ -1,9 +1,18 @@
 """Disk-backed inbox queue for messages received while no chat is bound or
 adapter dispatch is failing. Ported from
-``Repos/channel/src/queue.ts`` — same shape (`{pending, deadLetter}`), same
-retry limits, same `0o600` permission. Lives at
+``Repos/channel/src/queue.ts`` — same shape (``{pending, deadLetter}``),
+same retry limits, same ``0o600`` permission. Lives at
 ``~/.clawtell/inbox-queue.json`` (NOT under ``~/.openclaw/`` — the
 clawtell-core package is framework-agnostic by design).
+
+File schema is versioned (``version: 1``) so future changes can migrate
+old installs in place. Corrupt files are backed up to
+``inbox-queue.corrupt.<unix-ts>.json`` before the queue resets, instead
+of being silently truncated — silent data loss is unacceptable.
+
+A rolling ``replied`` list tracks recently-completed ``client.send()``
+calls so that a crash between send-reply and ack does NOT cause a
+double reply on server redelivery.
 """
 
 from __future__ import annotations
@@ -12,6 +21,7 @@ import json
 import logging
 import os
 import tempfile
+import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from threading import Lock
@@ -21,11 +31,22 @@ log = logging.getLogger(__name__)
 
 MAX_ATTEMPTS = 10
 DEAD_LETTER_CAP = 100
+REPLIED_CAP = 1000
+SCHEMA_VERSION = 1
 
 
 def _queue_path() -> Path:
     base = Path(os.environ.get("CLAWTELL_HOME") or (Path.home() / ".clawtell"))
     return base / "inbox-queue.json"
+
+
+def _empty_state() -> dict:
+    return {
+        "version": SCHEMA_VERSION,
+        "pending": [],
+        "deadLetter": [],
+        "replied": [],
+    }
 
 
 @dataclass
@@ -52,12 +73,41 @@ class InboxQueue:
 
     def _read(self) -> dict:
         try:
-            return json.loads(self._path.read_text(encoding="utf-8"))
+            raw = self._path.read_text(encoding="utf-8")
         except FileNotFoundError:
-            return {"pending": [], "deadLetter": []}
+            return _empty_state()
+        try:
+            data = json.loads(raw)
         except json.JSONDecodeError as e:
-            log.warning("queue file corrupt (%s); starting fresh", e)
-            return {"pending": [], "deadLetter": []}
+            backup = self._path.with_name(
+                f"inbox-queue.corrupt.{int(time.time())}.json"
+            )
+            try:
+                self._path.parent.mkdir(parents=True, exist_ok=True)
+                backup.write_text(raw, encoding="utf-8")
+                os.chmod(backup, 0o600)
+                log.error(
+                    "queue file corrupt (%s); backed up to %s and starting fresh",
+                    e,
+                    backup,
+                )
+            except OSError as backup_err:
+                log.error(
+                    "queue file corrupt (%s); backup ALSO failed (%s); "
+                    "starting fresh anyway",
+                    e,
+                    backup_err,
+                )
+            return _empty_state()
+        # Forward-compat: ensure new keys are present even if reading a
+        # pre-versioned file (older clawtell-core wrote no ``version``,
+        # ``replied`` keys).
+        data.setdefault("version", 0)
+        data.setdefault("pending", [])
+        data.setdefault("deadLetter", [])
+        data.setdefault("replied", [])
+        data["version"] = SCHEMA_VERSION
+        return data
 
     def _write(self, data: dict) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -116,6 +166,29 @@ class InboxQueue:
                 return found
             self._write(data)
             return None
+
+    def mark_replied(self, msg_id: str) -> None:
+        """Record that we successfully called ``client.send()`` for this
+        inbound's reply. Used to prevent double-reply if we crash before
+        the subsequent ack reaches the server and the message is
+        redelivered."""
+        with self._lock:
+            data = self._read()
+            replied = data.get("replied", [])
+            if any(entry.get("id") == msg_id for entry in replied):
+                return
+            replied.append({"id": msg_id, "ts": int(time.time())})
+            if len(replied) > REPLIED_CAP:
+                replied = replied[-REPLIED_CAP:]
+            data["replied"] = replied
+            self._write(data)
+
+    def has_replied(self, msg_id: str) -> bool:
+        with self._lock:
+            data = self._read()
+            return any(
+                entry.get("id") == msg_id for entry in data.get("replied", [])
+            )
 
     def get_pending(self) -> list[dict]:
         with self._lock:
