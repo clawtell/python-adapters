@@ -80,11 +80,20 @@ class TelegramBridge:
     ) -> None:
         self._token = bot_token
         self._base = f"https://api.telegram.org/bot{bot_token}"
-        self._client = client or httpx.AsyncClient(timeout=poll_timeout + 5)
+        # Lazy-init the AsyncClient: callers that only use attach() to
+        # replay persisted chat should not pay for a network client they
+        # never use (and that would otherwise leak under pytest, blocking
+        # event-loop teardown).
+        self._client: Optional[httpx.AsyncClient] = client
         self._poll_timeout = poll_timeout
         self._adapter: Optional[ClawTellAdapter] = None
         self._offset: Optional[int] = None
         self._stop = asyncio.Event()
+
+    def _ensure_client(self) -> httpx.AsyncClient:
+        if self._client is None:
+            self._client = httpx.AsyncClient(timeout=self._poll_timeout + 5)
+        return self._client
 
     def attach(self, adapter: ClawTellAdapter) -> None:
         """Bind ``adapter`` and replay any persisted chat immediately."""
@@ -106,6 +115,7 @@ class TelegramBridge:
                 "TelegramBridge.attach(adapter) must be called before run()"
             )
         log.info("telegram bridge polling for chat capture")
+        client = self._ensure_client()
         try:
             while not self._stop.is_set():
                 try:
@@ -119,13 +129,14 @@ class TelegramBridge:
                 for u in updates:
                     self._handle_update(u)
         finally:
-            await self._client.aclose()
+            await client.aclose()
 
     async def _poll_once(self) -> list[dict]:
         params: dict[str, Any] = {"timeout": self._poll_timeout}
         if self._offset is not None:
             params["offset"] = self._offset
-        r = await self._client.get(f"{self._base}/getUpdates", params=params)
+        client = self._ensure_client()
+        r = await client.get(f"{self._base}/getUpdates", params=params)
         r.raise_for_status()
         data = r.json()
         if not data.get("ok"):
