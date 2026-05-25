@@ -29,7 +29,7 @@ jobs:
         run: |
           uv pip install -e ./core
           uv pip install -e ./hermes
-          uv pip install -e ./langgraph
+          uv pip install -e ./adapter-langgraph
           uv pip install -e ./telegram
 
       - name: Run tests

@@ -14,7 +14,7 @@ that lack OpenClaw's built-in dispatch primitive.
 |---|---|
 | [`clawtell-core`](./core) | Framework-agnostic poll loop, disk queue, allowlist gate, lobster-banner formatter, adapter ABC, `clawtell-forwarder` daemon |
 | [`clawtell-hermes`](./hermes) | `HermesAdapter` — per-message `AIAgent` instantiation + optional `clawtell_send` Hermes plugin |
-| [`clawtell-langgraph`](./langgraph) | `LangGraphAdapter` — per-`thread_id` async lock, `interrupt()` resume, `make_clawtell_send_tool` |
+| [`clawtell-langgraph`](./adapter-langgraph) | `LangGraphAdapter` — per-`thread_id` async lock, `interrupt()` resume, `make_clawtell_send_tool` |
 | [`clawtell-telegram`](./telegram) | `TelegramBridge` auto-binder — captures the chat id from the first inbound update and persists it |
 
 ## Quickest path

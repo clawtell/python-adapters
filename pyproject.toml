@@ -1,5 +1,9 @@
 [tool.uv.workspace]
-members = ["core", "hermes", "langgraph", "telegram"]
+# adapter-langgraph (not langgraph) — the directory name must NOT shadow the
+# ``langgraph`` PyPI package. uv installs each workspace member as editable,
+# which puts the member dir on sys.path; ``langgraph/`` would mask the real
+# package and break ``from langgraph.types import Command``.
+members = ["core", "hermes", "adapter-langgraph", "telegram"]
 
 [tool.uv.sources]
 clawtell-core = { workspace = true }
@@ -22,7 +26,7 @@ asyncio_mode = "auto"
 # package directories each ship a ``tests/test_adapter.py``. Without it,
 # pytest hashes ``test_adapter`` once and refuses the second collection.
 addopts = "--import-mode=importlib"
-testpaths = ["core/tests", "hermes/tests", "langgraph/tests", "telegram/tests"]
+testpaths = ["core/tests", "hermes/tests", "adapter-langgraph/tests", "telegram/tests"]
 filterwarnings = [
     "ignore::DeprecationWarning",
 ]

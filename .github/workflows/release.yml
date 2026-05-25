@@ -6,12 +6,12 @@ on:
     paths:
       - 'core/pyproject.toml'
       - 'hermes/pyproject.toml'
-      - 'langgraph/pyproject.toml'
+      - 'adapter-langgraph/pyproject.toml'
       - 'telegram/pyproject.toml'
   workflow_dispatch:
     inputs:
       package:
-        description: 'Package to force-publish (core, hermes, langgraph, telegram, or all). Leave empty to publish only changed packages.'
+        description: 'Package to force-publish (core, hermes, langgraph, telegram, or all). Leave empty to publish only changed packages. Accepts either the short name or the workspace dir.'
         required: false
         default: ''
 
@@ -25,10 +25,10 @@ jobs:
       fail-fast: false
       matrix:
         package:
-          - { dir: core,      name: clawtell-core }
-          - { dir: hermes,    name: clawtell-hermes }
-          - { dir: langgraph, name: clawtell-langgraph }
-          - { dir: telegram,  name: clawtell-telegram }
+          - { dir: core,              name: clawtell-core }
+          - { dir: hermes,            name: clawtell-hermes }
+          - { dir: adapter-langgraph, name: clawtell-langgraph }
+          - { dir: telegram,          name: clawtell-telegram }
     steps:
       - uses: actions/checkout@v4
         with:
@@ -38,7 +38,9 @@ jobs:
         id: decide
         run: |
           force="${{ github.event.inputs.package }}"
-          if [ "$force" = "all" ] || [ "$force" = "${{ matrix.package.dir }}" ]; then
+          short_name="${{ matrix.package.name }}"
+          short_name="${short_name#clawtell-}"
+          if [ "$force" = "all" ] || [ "$force" = "${{ matrix.package.dir }}" ] || [ "$force" = "$short_name" ]; then
             echo "publish=true" >> $GITHUB_OUTPUT
           elif git diff --name-only HEAD^ HEAD 2>/dev/null | grep -q "^${{ matrix.package.dir }}/pyproject.toml$"; then
             echo "publish=true" >> $GITHUB_OUTPUT
