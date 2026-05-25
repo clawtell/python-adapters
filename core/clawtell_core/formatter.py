@@ -28,6 +28,12 @@ def _attachments_line(msg: InboundMessage) -> str:
 def format_inbound(msg: InboundMessage) -> str:
     """Render an incoming message for the human chat (no agent reply yet).
 
+    Matches the OpenClaw channel plugin's lobster-banner template
+    (channel/src/poll.ts) — banner, ``From: tell/<sender>``, optional
+    ``Subject:``, blank line, body. Receive timestamp is visible in the
+    Telegram bubble itself, and ``auto_reply_eligible`` is daemon-log
+    metadata, not human-chat content.
+
     Plain text — no parse_mode required at the Telegram send site. Keep
     body content as-is so users don't have to worry about escaping
     markdown / HTML inside their messages.
@@ -36,9 +42,7 @@ def format_inbound(msg: InboundMessage) -> str:
     return (
         f"{BANNER}\n"
         f"From: tell/{msg.from_name}{subject_line}\n\n"
-        f"{msg.body}\n\n"
-        f"At: {msg.received_at}\n"
-        f"Auto-reply eligible: {msg.auto_reply_eligible}"
+        f"{msg.body}"
         f"{_attachments_line(msg)}"
     )
 
@@ -55,7 +59,6 @@ def format_reply(reply: AgentReply, msg: InboundMessage) -> str:
         f"{BANNER}\n"
         f"From: tell/{msg.from_name}{subject_line}\n\n"
         f"{msg.body}\n\n"
-        f"{reply_block}\n\n"
-        f"At: {msg.received_at}"
+        f"{reply_block}"
         f"{_attachments_line(msg)}"
     )

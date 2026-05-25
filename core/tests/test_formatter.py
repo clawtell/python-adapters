@@ -26,7 +26,11 @@ def test_format_inbound_contains_banner_from_subject_body():
     assert "From: tell/alice" in out
     assert "Subject: quick q" in out
     assert "ping?" in out
-    assert "Auto-reply eligible: True" in out
+    # Matches OpenClaw lobster banner exactly — receive timestamp lives
+    # in the Telegram bubble itself; auto_reply_eligible is daemon-log
+    # metadata only, not human-chat content.
+    assert "At:" not in out
+    assert "Auto-reply eligible" not in out
     assert "Attachments:" not in out
 
 
