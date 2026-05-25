@@ -52,6 +52,58 @@ def _load_dotted(spec: str) -> Any:
     return getattr(mod, attr)
 
 
+def _normalize_directory(data: object) -> dict[str, str]:
+    """Accept either the flat ClawTell shape or the OpenClaw nested shape.
+
+    Flat (documented)::
+
+        {"alice": "111", "_default": "222"}
+
+    OpenClaw nested (what hand-rolled forwarders that mimic OpenClaw's
+    ``sessions.json`` / ``channel_directory.json`` tend to produce)::
+
+        {
+            "updated_at": "...",
+            "platforms": {
+                "telegram": [
+                    {"id": "111", "name": "alice", "type": "private"},
+                    ...
+                ]
+            }
+        }
+
+    The nested shape is auto-flattened: the first telegram entry becomes
+    ``_default``; entries with a ``name`` also map by name. This lets
+    users migrate from an OpenClaw-style file without re-shaping it.
+    """
+    if not isinstance(data, dict):
+        return {}
+    platforms = data.get("platforms")
+    if isinstance(platforms, dict):
+        result: dict[str, str] = {}
+        telegram = platforms.get("telegram") or []
+        if isinstance(telegram, list):
+            for entry in telegram:
+                if not isinstance(entry, dict):
+                    continue
+                chat_id = entry.get("id") or entry.get("chat_id")
+                if chat_id is None:
+                    continue
+                chat_id_str = str(chat_id)
+                if "_default" not in result:
+                    result["_default"] = chat_id_str
+                name = entry.get("name") or entry.get("sender_name")
+                if name:
+                    result[str(name)] = chat_id_str
+        return result
+    # Flat shape: keep only scalar values, coerce to str.
+    return {
+        str(k): str(v)
+        for k, v in data.items()
+        if not isinstance(v, (dict, list))
+    }
+
+
 def _load_directory() -> dict[str, str]:
     path = Path(
         os.environ.get("CLAWTELL_CHANNEL_DIRECTORY")
@@ -59,13 +111,12 @@ def _load_directory() -> dict[str, str]:
     )
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(data, dict):
-            return {str(k): str(v) for k, v in data.items()}
     except FileNotFoundError:
         return {}
     except (OSError, json.JSONDecodeError) as e:
         log.warning("could not read channel directory at %s: %s", path, e)
-    return {}
+        return {}
+    return _normalize_directory(data)
 
 
 class _ForwardOnlyAdapter(ClawTellAdapter):
