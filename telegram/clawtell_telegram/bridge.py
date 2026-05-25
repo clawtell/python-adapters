@@ -118,6 +118,12 @@ class TelegramBridge:
         client = self._ensure_client()
         try:
             while not self._stop.is_set():
+                # Yield to the event loop on every iteration. Without this,
+                # a transport that resolves synchronously (e.g. httpx.
+                # MockTransport in tests, or a misconfigured server that
+                # always returns instantly) starves the loop and blocks
+                # both stop() and any wait_for() timer from firing.
+                await asyncio.sleep(0)
                 try:
                     updates = await self._poll_once()
                 except asyncio.CancelledError:
