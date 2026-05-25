@@ -43,28 +43,54 @@ class HermesAdapter(ClawTellAdapter):
         sender: TelegramSender,
         *,
         agent_pool_size: int = 0,
+        factory_timeout: float = 30.0,
     ) -> None:
         self._factory = agent_factory
         self._sender = sender
         self._pool_size = max(0, int(agent_pool_size))
         self._pool: OrderedDict[str, Any] = OrderedDict()
         self._pool_lock = asyncio.Lock()
+        # ``factory_timeout <= 0`` disables the timeout. Catches the
+        # "first inbound message → fresh AIAgent ctor hangs forever"
+        # stall mode under memory pressure (Hermes 2-instance container,
+        # 2026-05-25 field report).
+        self._factory_timeout = float(factory_timeout)
+
+    async def _call_factory(self) -> Any:
+        if self._factory_timeout > 0:
+            try:
+                return await asyncio.wait_for(
+                    asyncio.to_thread(self._factory),
+                    timeout=self._factory_timeout,
+                )
+            except asyncio.TimeoutError as e:
+                raise TimeoutError(
+                    f"agent_factory did not return within "
+                    f"{self._factory_timeout:.1f}s — likely stalled on "
+                    f"AIAgent ctor (model load, network, or memory pressure). "
+                    f"Increase --factory-timeout if your factory is heavy."
+                ) from e
+        return await asyncio.to_thread(self._factory)
 
     async def _get_agent(self, sender_name: str) -> Any:
         if self._pool_size == 0:
-            return self._factory()
+            return await self._call_factory()
         async with self._pool_lock:
             if sender_name in self._pool:
                 self._pool.move_to_end(sender_name)
                 return self._pool[sender_name]
-            agent = self._factory()
+            agent = await self._call_factory()
             self._pool[sender_name] = agent
             if len(self._pool) > self._pool_size:
                 self._pool.popitem(last=False)
             return agent
 
     async def inject(self, msg: InboundMessage) -> Optional[AgentReply]:
-        agent = await self._get_agent(msg.from_name)
+        try:
+            agent = await self._get_agent(msg.from_name)
+        except TimeoutError as e:
+            log.error("hermes factory timed out for msg %s: %s", msg.id, e)
+            return AgentReply(text="", refusal=str(e))
         prompt = self._build_prompt(msg)
         try:
             chat_fn = getattr(agent, "chat", None)

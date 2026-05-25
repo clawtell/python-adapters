@@ -52,6 +52,26 @@ def _load_dotted(spec: str) -> Any:
     return getattr(mod, attr)
 
 
+async def _load_dotted_with_timeout(spec: str, timeout: float, kind: str) -> Any:
+    """Import a dotted spec under a wall-clock timeout. Catches module-level
+    side effects (model load, network call, etc.) that would otherwise hang
+    the daemon at startup before ``subscribe()`` is ever called."""
+    if timeout <= 0:
+        return _load_dotted(spec)
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(_load_dotted, spec),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError as e:
+        raise TimeoutError(
+            f"{kind} {spec!r} did not import within {timeout:.1f}s — "
+            f"likely module-level side effects (model load, network, "
+            f"heavy ctor at import). Increase --factory-timeout or move "
+            f"side effects into the factory body."
+        ) from e
+
+
 def _normalize_directory(data: object) -> dict[str, str]:
     """Accept either the flat ClawTell shape or the OpenClaw nested shape.
 
@@ -211,15 +231,45 @@ async def _amain(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 2
-        adapter_cls = _load_dotted(args.adapter)
+        try:
+            adapter_cls = await _load_dotted_with_timeout(
+                args.adapter, args.factory_timeout, "adapter"
+            )
+        except TimeoutError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 2
         kwargs: dict = {"sender": sender}
+        # Forward the timeout to adapters that accept it (HermesAdapter
+        # uses it for the per-message factory call). Adapters that don't
+        # take the kwarg ignore it via the explicit branch below.
         if args.agent_factory:
-            kwargs["agent_factory"] = _load_dotted(args.agent_factory)
+            try:
+                kwargs["agent_factory"] = await _load_dotted_with_timeout(
+                    args.agent_factory, args.factory_timeout, "agent factory"
+                )
+            except TimeoutError as e:
+                print(f"error: {e}", file=sys.stderr)
+                return 2
+            kwargs["factory_timeout"] = args.factory_timeout
         if args.graph_factory:
             # LangGraph-style: invoke the factory once and pass the
             # compiled graph as `graph=`. Hermes-style uses agent_factory
             # because it instantiates one agent per message.
-            kwargs["graph"] = _load_dotted(args.graph_factory)()
+            try:
+                graph_factory = await _load_dotted_with_timeout(
+                    args.graph_factory, args.factory_timeout, "graph factory"
+                )
+                kwargs["graph"] = await asyncio.wait_for(
+                    asyncio.to_thread(graph_factory),
+                    timeout=args.factory_timeout,
+                ) if args.factory_timeout > 0 else graph_factory()
+            except (TimeoutError, asyncio.TimeoutError) as e:
+                print(
+                    f"error: graph factory {args.graph_factory!r} did not "
+                    f"build within {args.factory_timeout:.1f}s: {e}",
+                    file=sys.stderr,
+                )
+                return 2
         adapter: ClawTellAdapter = adapter_cls(**kwargs)
     else:
         if not sender:
@@ -269,6 +319,17 @@ def main() -> None:
     p.add_argument("--default-chat", help="Telegram chat_id fallback if no directory")
     p.add_argument("--api-key", help="override CLAWTELL_API_KEY")
     p.add_argument("--name", help="override CLAWTELL_NAME")
+    p.add_argument(
+        "--factory-timeout",
+        type=float,
+        default=float(os.environ.get("CLAWTELL_FACTORY_TIMEOUT", "30") or 30),
+        help=(
+            "seconds to wait for adapter/agent_factory/graph_factory imports "
+            "and for per-message AIAgent construction before giving up. "
+            "Catches model-load / memory-pressure stalls. 0 disables. "
+            "Default 30 (env: CLAWTELL_FACTORY_TIMEOUT)."
+        ),
+    )
     p.add_argument(
         "--log-level",
         default=os.environ.get("CLAWTELL_LOG_LEVEL", "INFO"),

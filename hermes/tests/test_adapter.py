@@ -135,6 +135,49 @@ async def test_chat_exception_returns_refusal():
 
 
 @pytest.mark.asyncio
+async def test_factory_timeout_returns_refusal():
+    """Hermes ctor hangs (model load, memory pressure) → adapter must NOT
+    block the subscribe loop forever. It returns a refusal AgentReply so
+    the inbound can still be acked + forwarded to the human."""
+    import time
+
+    def slow_factory():
+        time.sleep(2.0)  # blocks the to_thread worker
+        return _StubAgent()
+
+    adapter = HermesAdapter(
+        agent_factory=slow_factory,
+        sender=_noop_sender,
+        factory_timeout=0.2,
+    )
+    reply = await adapter.inject(_msg("m1"))
+    assert reply is not None
+    assert reply.refusal is not None
+    assert "factory_timeout" not in reply.refusal  # human-readable message
+    assert "0.2s" in reply.refusal or "did not return" in reply.refusal
+
+
+@pytest.mark.asyncio
+async def test_factory_timeout_zero_disables():
+    """Explicit opt-out — long ctors are allowed when timeout is 0."""
+    import time
+
+    def slow_factory():
+        time.sleep(0.3)
+        return _StubAgent()
+
+    adapter = HermesAdapter(
+        agent_factory=slow_factory,
+        sender=_noop_sender,
+        factory_timeout=0,
+    )
+    reply = await adapter.inject(_msg("m1"))
+    assert reply is not None
+    assert reply.refusal is None
+    assert reply.text == "ok"
+
+
+@pytest.mark.asyncio
 async def test_forward_invokes_sender_with_formatted_text():
     sent: list[tuple[str, str]] = []
 
