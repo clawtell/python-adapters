@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "clawtell-core"
-version = "2026.5.31"
+version = "2026.6.0"
 description = "Framework-agnostic ClawTell adapter loop: subscribe, queue, allowlist, formatting. Pairs with clawtell-hermes, clawtell-langgraph, etc."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -19,7 +19,7 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
 ]
 dependencies = [
-    "clawtell>=2026.3.21",
+    "clawtell>=2026.6.0",
     # daemon Telegram sender + adapter-internal sender fallback both
     # use httpx. clawtell SDK uses `requests` so we cannot rely on
     # transitive pull-in.
