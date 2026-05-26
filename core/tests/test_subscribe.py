@@ -31,7 +31,7 @@ class _StubClient:
             return {"messages": self._batches.pop(0)}
         return {"messages": []}
 
-    def ack(self, ids: list[str]) -> None:
+    def ack(self, ids: list[str], **kw) -> None:
         self.acked.extend(ids)
 
     def send(self, to: str, body: str, subject: Optional[str] = None) -> dict:
@@ -196,6 +196,7 @@ async def test_heartbeat_file_touched_during_loop(
     await subscribe(
         client,
         adapter,
+        force_poll=True,
         poll_timeout=0,
         empty_poll_sleep=0.05,
         drain_interval=999,
@@ -228,6 +229,7 @@ async def test_subscribe_dedups_redelivered_id(isolated_clawtell_home):
     await subscribe(
         client,
         adapter,
+        force_poll=True,
         poll_timeout=0,
         empty_poll_sleep=0.05,
         drain_interval=999,

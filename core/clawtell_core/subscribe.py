@@ -27,6 +27,15 @@ from clawtell_core.adapter import (
     InboundMessage,
 )
 from clawtell_core.queue import InboxQueue, QueuedMessage
+from clawtell_core.transport import (
+    DEFAULT_BACKOFF_BASE_MS,
+    DEFAULT_BACKOFF_CEILING_MS,
+    DEFAULT_FALLBACK_TTL_SECONDS,
+    DEFAULT_SSE_FAILURE_THRESHOLD,
+    DEFAULT_STREAM_LIMIT,
+    DEFAULT_STREAM_TIMEOUT,
+    iter_messages,
+)
 
 log = logging.getLogger(__name__)
 
@@ -80,6 +89,13 @@ async def subscribe(
     *,
     poll_timeout: int = 30,
     poll_limit: int = 50,
+    stream_timeout: int = DEFAULT_STREAM_TIMEOUT,
+    stream_limit: int = DEFAULT_STREAM_LIMIT,
+    force_poll: bool = False,
+    sse_failure_threshold: int = DEFAULT_SSE_FAILURE_THRESHOLD,
+    sse_backoff_base_ms: int = DEFAULT_BACKOFF_BASE_MS,
+    sse_backoff_ceiling_ms: int = DEFAULT_BACKOFF_CEILING_MS,
+    fallback_ttl_seconds: float = DEFAULT_FALLBACK_TTL_SECONDS,
     drain_interval: float = 60.0,
     empty_poll_sleep: float = 1.0,
     stop_event: Optional[asyncio.Event] = None,
@@ -87,13 +103,30 @@ async def subscribe(
 ) -> None:
     """Run the receive loop until ``stop_event`` is set (or forever).
 
+    SSE-first transport: opens ``client.stream()`` against the ClawTell SSE
+    endpoint and consumes messages in real time. On ``sse_failure_threshold``
+    consecutive SSE failures, logs a single warning and switches to
+    ``client.poll()`` for ``fallback_ttl_seconds``; then auto-recovers to SSE.
+
     Args:
         client: a ``clawtell.ClawTell`` (or duck-typed) instance with
-            ``poll``, ``ack``, ``send``.
+            ``stream``, ``poll``, ``ack``, ``send``.
         adapter: a ``ClawTellAdapter`` subclass instance.
-        poll_timeout: long-poll seconds passed through to ``client.poll``.
+        poll_timeout: long-poll seconds passed to ``client.poll`` during fallback.
         poll_limit: max messages per poll.
+        stream_timeout: server-side hold seconds passed to ``client.stream``
+            (default 120, matches OpenClaw plugin).
+        stream_limit: max events per SSE connection.
+        force_poll: when True (or ``CLAWTELL_FORCE_POLL=1`` env), skip SSE
+            entirely and use ``client.poll()`` only.
+        sse_failure_threshold: consecutive SSE failures before switching to
+            poll fallback (default 3).
+        sse_backoff_base_ms / sse_backoff_ceiling_ms: exponential backoff
+            bounds applied between SSE retries.
+        fallback_ttl_seconds: how long to stay in poll fallback before retrying
+            SSE (default 60s, sticky).
         drain_interval: seconds between queue-drain attempts.
+        empty_poll_sleep: sleep duration when a poll returns no messages.
         stop_event: optional asyncio.Event to break the loop.
         heartbeat_file: optional path touched at every progress checkpoint.
             External watchdogs (systemd, k8s liveness, sidecar cron) can
@@ -102,40 +135,52 @@ async def subscribe(
     queue = InboxQueue()
     dedup = _DedupWindow()
     last_drain = 0.0
-    log.info("subscribe loop starting (timeout=%ds, limit=%d)", poll_timeout, poll_limit)
+    stop_event = stop_event or asyncio.Event()
+    log.info(
+        "subscribe loop starting (transport=SSE-first, "
+        "sse_failure_threshold=%d, fallback_ttl=%ds, force_poll=%s)",
+        sse_failure_threshold,
+        int(fallback_ttl_seconds),
+        force_poll,
+    )
     _touch_heartbeat(heartbeat_file)
 
-    while not (stop_event and stop_event.is_set()):
+    async for raw in iter_messages(
+        client,
+        stop_event=stop_event,
+        force_poll=force_poll,
+        poll_timeout=poll_timeout,
+        poll_limit=poll_limit,
+        stream_timeout=stream_timeout,
+        stream_limit=stream_limit,
+        sse_failure_threshold=sse_failure_threshold,
+        sse_backoff_base_ms=sse_backoff_base_ms,
+        sse_backoff_ceiling_ms=sse_backoff_ceiling_ms,
+        fallback_ttl_seconds=fallback_ttl_seconds,
+        empty_poll_sleep=empty_poll_sleep,
+    ):
+        if stop_event.is_set():
+            break
         _touch_heartbeat(heartbeat_file)
-        try:
-            res = await asyncio.to_thread(
-                client.poll, timeout=poll_timeout, limit=poll_limit
-            )
-        except Exception as e:  # transient HTTP errors etc.
-            log.warning("poll error: %s; sleeping 5s", e)
-            await asyncio.sleep(5)
-            continue
 
-        messages = res.get("messages", []) or []
-        for raw in messages:
-            msg = InboundMessage.from_dict(raw)
-            if dedup.seen(msg.id):
-                log.debug("skipping duplicate msg %s", msg.id)
-                # Re-ack defensively in case the prior ack didn't land.
-                try:
-                    await asyncio.to_thread(client.ack, [msg.id])
-                except Exception:
-                    pass
-                continue
-            # Only mark seen when we've TAKEN RESPONSIBILITY for the
-            # message (acked, or persisted to the queue). On dispatch
-            # failure, leave it un-deduped so the server's natural
-            # redelivery retries us — otherwise the safety-net dedup
-            # would itself cause data loss.
-            handled = await _process(client, adapter, queue, msg)
-            if handled:
-                dedup.add(msg.id)
-            _touch_heartbeat(heartbeat_file)
+        msg = InboundMessage.from_dict(raw)
+        if dedup.seen(msg.id):
+            log.debug("skipping duplicate msg %s", msg.id)
+            # Re-ack defensively in case the prior ack didn't land.
+            try:
+                await asyncio.to_thread(client.ack, [msg.id], prefer_sse=True)
+            except Exception:
+                pass
+            continue
+        # Only mark seen when we've TAKEN RESPONSIBILITY for the
+        # message (acked, or persisted to the queue). On dispatch
+        # failure, leave it un-deduped so the server's natural
+        # redelivery retries us — otherwise the safety-net dedup
+        # would itself cause data loss.
+        handled = await _process(client, adapter, queue, msg)
+        if handled:
+            dedup.add(msg.id)
+        _touch_heartbeat(heartbeat_file)
 
         # Periodic queue drain — same flow per queued message.
         now = time.monotonic()
@@ -143,11 +188,6 @@ async def subscribe(
             last_drain = now
             await _drain(client, adapter, queue, dedup)
             _touch_heartbeat(heartbeat_file)
-
-        # Empty poll → brief sleep so we don't spin on rare server quirks.
-        if not messages:
-            _touch_heartbeat(heartbeat_file)
-            await asyncio.sleep(empty_poll_sleep)
 
 
 async def _process(
@@ -185,7 +225,7 @@ async def _process(
         if not msg.auto_reply_eligible:
             # Branch 2: forward inbound, do NOT invoke agent.
             await adapter.forward(HumanNotification(inbound=msg), chat)
-            await asyncio.to_thread(client.ack, [msg.id])
+            await asyncio.to_thread(client.ack, [msg.id], prefer_sse=True)
             log.info(
                 "forwarded ineligible msg %s from tell/%s to %s",
                 msg.id,
@@ -221,7 +261,7 @@ async def _process(
                     log.error(
                         "reply send-back failed for msg %s: %s", msg.id, e
                     )
-        await asyncio.to_thread(client.ack, [msg.id])
+        await asyncio.to_thread(client.ack, [msg.id], prefer_sse=True)
         log.info("handled msg %s from tell/%s", msg.id, msg.from_name)
         return True
 
@@ -272,7 +312,7 @@ async def _drain(
                         f"Re: {msg.subject}" if msg.subject else None,
                     )
                     queue.mark_replied(msg.id)
-            await asyncio.to_thread(client.ack, [msg.id])
+            await asyncio.to_thread(client.ack, [msg.id], prefer_sse=True)
             queue.dequeue(msg.id)
             dedup.add(msg.id)
         except Exception as e:
