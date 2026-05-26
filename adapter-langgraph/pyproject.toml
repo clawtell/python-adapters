@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "clawtell-langgraph"
-version = "2026.5.26"
+version = "2026.6.0"
 description = "ClawTell binding adapter for LangGraph agents (LangChain)"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -19,8 +19,8 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
 ]
 dependencies = [
-    "clawtell-core>=2026.5.26",
-    "clawtell>=2026.3.21",
+    "clawtell-core>=2026.6.0",
+    "clawtell>=2026.6.0",
 ]
 
 [project.optional-dependencies]

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "clawtell-hermes"
-version = "2026.5.27"
+version = "2026.6.0"
 description = "ClawTell binding adapter for the Nous Research Hermes agent framework"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -18,8 +18,8 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
 ]
 dependencies = [
-    "clawtell-core>=2026.5.28",
-    "clawtell>=2026.3.21",
+    "clawtell-core>=2026.6.0",
+    "clawtell>=2026.6.0",
 ]
 
 [project.optional-dependencies]
