@@ -612,7 +612,32 @@ async def _cmd_send_test(args: argparse.Namespace) -> int:
 # ─────────────────────────────── entry ────────────────────────────────
 
 
-def _add_common_flags(p: argparse.ArgumentParser) -> None:
+def _add_common_flags(p: argparse.ArgumentParser, *, on_subparser: bool = False) -> None:
+    """Add flags shared by the main parser AND every subparser.
+
+    When ``on_subparser=True`` we use ``argparse.SUPPRESS`` as the default so
+    the subparser does NOT write the attribute when the user omits the flag.
+    Without this, ``argparse._SubParsersAction`` would overwrite a value the
+    user passed BEFORE the subcommand with the subparser's default (None /
+    ""TG_BOT_TOKEN""). Verified empirically:
+
+        clawtell-forwarder --api-key XYZ check  # api_key would become None
+    """
+    if on_subparser:
+        sup = argparse.SUPPRESS
+        p.add_argument("--api-key", default=sup, help="override CLAWTELL_API_KEY")
+        p.add_argument("--name", default=sup, help="override CLAWTELL_NAME")
+        p.add_argument(
+            "--telegram-token-env",
+            default=sup,
+            help="env var holding the Telegram bot token",
+        )
+        p.add_argument(
+            "--log-level",
+            default=sup,
+            help="DEBUG / INFO / WARNING / ERROR",
+        )
+        return
     p.add_argument("--api-key", help="override CLAWTELL_API_KEY")
     p.add_argument("--name", help="override CLAWTELL_NAME")
     p.add_argument(
@@ -678,14 +703,18 @@ def main() -> None:
         "check",
         help="validate config end-to-end (API auth, Telegram token, chat binding)",
     )
-    _add_common_flags(check_p)
-    check_p.add_argument("--default-chat", help="Telegram chat_id to validate")
+    _add_common_flags(check_p, on_subparser=True)
+    check_p.add_argument(
+        "--default-chat",
+        default=argparse.SUPPRESS,
+        help="Telegram chat_id to validate",
+    )
 
     disc_p = sub.add_parser(
         "discover-chat",
         help="capture chat_id from the first inbound Telegram update",
     )
-    _add_common_flags(disc_p)
+    _add_common_flags(disc_p, on_subparser=True)
     disc_p.add_argument(
         "--write",
         action="store_true",
@@ -702,10 +731,11 @@ def main() -> None:
         "send-test",
         help='send a "ClawTell connected" test message end-to-end',
     )
-    _add_common_flags(sent_p)
+    _add_common_flags(sent_p, on_subparser=True)
     sent_p.add_argument("--to", help="sender name from channel-directory.json")
     sent_p.add_argument(
         "--default-chat",
+        default=argparse.SUPPRESS,
         help="Telegram chat_id to send to (overrides directory)",
     )
 

@@ -8,5 +8,16 @@ Per-thread asyncio locks, ``interrupt()`` detection via
 from clawtell_langgraph.adapter import LangGraphAdapter
 from clawtell_langgraph.tools import make_clawtell_send_tool
 
-__version__ = "2026.5.25"
+try:
+    from importlib.metadata import PackageNotFoundError, version as _pkg_version
+
+    __version__ = _pkg_version("clawtell-langgraph")
+except PackageNotFoundError:
+    __version__ = "0+unknown"
+finally:
+    try:
+        del _pkg_version, PackageNotFoundError
+    except NameError:
+        pass
+
 __all__ = ["LangGraphAdapter", "make_clawtell_send_tool"]

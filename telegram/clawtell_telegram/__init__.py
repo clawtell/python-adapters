@@ -13,5 +13,16 @@ single-active-chat case.
 
 from clawtell_telegram.bridge import TelegramBridge, load_persisted_chat
 
-__version__ = "2026.5.25"
+try:
+    from importlib.metadata import PackageNotFoundError, version as _pkg_version
+
+    __version__ = _pkg_version("clawtell-telegram")
+except PackageNotFoundError:
+    __version__ = "0+unknown"
+finally:
+    try:
+        del _pkg_version, PackageNotFoundError
+    except NameError:
+        pass
+
 __all__ = ["TelegramBridge", "load_persisted_chat"]
